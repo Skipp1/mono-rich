@@ -1,0 +1,711 @@
+\documentclass[10pt, a4paper]{article}
+\usepackage[UKenglish]{babel}
+\usepackage{xcolor, graphicx}
+\usepackage{imakeidx}
+\usepackage{fontspec}
+\usepackage{amsmath, amssymb, amsfonts}
+\usepackage{textcomp}
+\setmainfont{CMU Serif}
+\setmonofont[
+Scale = MatchLowercase,
+ItalicFont = JuliaMono Light Italic,
+BoldFont = JuliaMono Bold,
+]{JuliaMono Light}
+\usepackage{microtype}
+\usepackage{comment}
+\usepackage{physics}
+\usepackage{siunitx}
+\usepackage{tikz}
+\usepackage{multicol}
+\usepackage{pbalance}
+\usepackage[hidelinks=t]{hyperref}
+\usepackage{bookmark}
+\usepackage{geometry}
+\usepackage[print=m, lang=python]{fortex}
+
+\makeindex
+
+\usetikzlibrary{decorations.markings}
+\definecolor{fortexbg}{HTML}{F8F8F0}
+\definecolor{fortextab}{HTML}{C0C0A8}
+\usemintedstyle{ayu}
+\setfortex{tabsize=2, breaksymbol=\scriptsize{$\hookrightarrow$}, fontsize=\small, breaklines, bgcolor=fortexbg, showtabs, tab={\rm{$\big|\hspace{0.825ex}$}}, tabcolor={fortextab}}
+\DefineShortVerb{\"}
+\newcommand{\nd}[1]{\oldstylenums{#1}\textsc{d}}
+
+\title{Determining the number of monopoles we should see}
+\author{Henry Linton}
+
+\begin{document}
+
+\maketitle
+
+This file is all about the calculation of the expected number of monopoles what we should see.
+This may seem like an awfully complex and slow method of calculating this, but it is important that it is done this was as none of the distributions here are normal distributions.
+As a consequence things like adding the mean / maximum likelihood just do not make sense (I was doing this as a sanity check and it took me way to long to realise the reason the results were not matching was because of this bad statistics.)
+
+The way that we are are doing it instead is by randomly sampling the likelihood distributions and adding / multiplying the samples, then constructing a new distribution out of that.
+Unfortunately doing it this was is both slow and annoying to implement. 
+
+The first part of this document concerns the sampling and propagation of these values, whereas the second part is applying this sampling to the data that has been collected from the algorithm detection, and madgraph. 
+
+\section{\texttt{fastlib.f90}}
+\label{sec:fastlib}
+\begin{subfile}{fortran}{fastlib.f90}
+
+This Fortran section contains all the stuff needed for sampling. I initially tried doing this in plain python, but wow it is slow. Like \emph{really} slow. 
+
+Even in Fortran it takes about 10 min for all the masses for a single monopole type to be calculated. (The algos here are probs not super optimal, but whatever, they work, and its faster than python).
+
+Here "BINS" refers to the number of psudorapidity $\eta$, and velocity $\beta$ situations we need to take care of. 
+"UNCERT_RES" is the resolution on the input and output distributions, and "SAMPLE_NO" is the number of random samples we are using. 
+
+\begin{codeblock}[noref]{fastlib}
+\begin{code}
+module fastlib
+	use ISO_C_BINDING
+	use omp_lib
+	use stdlib_math, only: linspace
+	use stdlib_io_npy, only: save_npy
+	implicit none
+	private
+	public :: prop_pdf, prop_pdf_all, prop_pdf_sum2d, choice
+	
+	integer :: BINS, UNCERT_RES, SAMPLE_NO
+	parameter(BINS=50, UNCERT_RES=1000, SAMPLE_NO=100000)
+	
+contains 
+\end{code}
+
+\subsection{\texttt{prop\_pdf}}
+\begin{codeblock}{prop_pdf}
+
+One weird thing about this algo is the selection of the operation $+$, $\times$, etc.
+As Fortran is not a dynamic language handing in an arbitrary function is a little bit hard. 
+However, all I am doing is simple $+$ and $\times$ operations anyway, so it realistically doesn't matter that it is done this way. 
+
+\begin{code}
+subroutine prop_pdf(op, p1, p2, x1, x2, h, xo) bind(c)
+	character(len=1, kind=c_char), intent(in) :: op 
+	real(c_double), dimension(UNCERT_RES), intent(in)  :: p1, p2, x1, x2
+	real(c_double), dimension(UNCERT_RES), intent(out) :: h, xo
+	
+	real(c_double), allocatable :: r1(:), r2(:)
+	
+	allocate(r1(SAMPLE_NO), r2(SAMPLE_NO))
+	
+	r1 = 0; r2 = 0
+	
+	call choice(p1, x1, r1)
+	call choice(p2, x2, r2)
+	
+	select case (op)
+	case ('*')
+		r1 = r1 * r2 
+	case ('+')
+		r1 = r1 + r2 
+	case ('-')
+		r1 = r1 - r2 
+	case ('/')
+		r1 = r1 / r2 
+	end select
+	
+	call binning(r1, xo, h)
+	
+end subroutine
+\end{code}
+\end{codeblock}
+
+\subsection{\texttt{choice}}
+
+This next subroutine is the biggest bottleneck in the entire process (At least according to "perf") I would \emph{very} much like to speed this up, but at the moment nothing is beating the method I have here. 
+
+The aim of this subroutine is to randomly take "SAMPLE_NO" samples from the probability density function (pdf). 
+Note that the pdf and the values that the pdf is sitting on ($x$) are two diffrent things, and this tripped me up for quite a while. 
+
+The algorithm works by first calculating the cumulative density function (cdf), and generating a random number. 
+The $x$ location of the cdf where it equals that random number is taken as the sample. 
+
+This is then repeated for "SAMPLE_NO" diffrent samples. 
+
+Note that calculating the cdf every time is not an issue as there are no pdf's that pass thought his function twice, so caching is useless. 
+
+\begin{codeblock}{choice}
+\begin{code}
+subroutine choice(pdf, x, retval) bind(c)
+	real(c_double), dimension(UNCERT_RES), intent(in)  :: pdf, x
+	real(c_double), dimension(SAMPLE_NO)  , intent(out) :: retval
+	
+	real(c_double), allocatable :: cdf(:), r(:)
+	
+	integer :: i, p(3), j
+	
+	allocate(r(SAMPLE_NO), cdf(UNCERT_RES))
+	
+	call random_number(r)
+	
+	cdf(1) = pdf(1)
+	do i = 2,UNCERT_RES
+		cdf(i) = cdf(i-1) + pdf(i)
+	end do
+\end{code}
+
+As a cdf is always ordered we can use a binary search to find where the random number is equal.
+
+\begin{code}
+	out: do concurrent (i = 1:SAMPLE_NO)
+		p = [1, nint(UNCERT_RES/2.), UNCERT_RES]
+		
+		do while (.True.)
+			if ( cdf(p(2)) - r(i) < 0 ) then 
+				p(1) = p(2)
+			else
+				p(3) = p(2)
+			end if 
+			
+			p(2) = nint( (p(1) + p(3))/2. )
+			
+			if ((abs(p(2) - p(1)) < 2 ) .or. (abs(p(2) - p(3)) < 2 )) then 
+				retval(i) = x(p(2))
+				cycle out
+			end if 
+			
+		end do 
+	end do out
+	
+end subroutine
+\end{code}
+\end{codeblock}
+
+\subsection{\texttt{binning}}
+This subroutine is essentially equivalent to the python line "H = plt.hist(A, bins=B)[0]".
+It calculates the number of samples $A$ previously drawn, that reside in each bin $B$. 
+
+Note that this implementation will error if $\min(A) = \max(A)$. 
+Though for the data I am testing I have yet to encounter a case where all the samples are exactly the same. 
+
+There is some clever indexing going on here, but we are turning the sample of each $x$ location in the range $A \in [\min(A), \max(A)]$ into an index in the range $[1, \text{\texttt{UNCERT\_RES}}]$. Finally we need to make sure that this new pdf is normalised so that the total area under the curve is equal to $1$
+
+\begin{codeblock}{binning}
+\begin{code}
+subroutine binning(A, B, H) 
+	real(c_double), intent(in)  :: A(SAMPLE_NO)
+	real(c_double), intent(out) :: B(UNCERT_RES)
+	real(c_double), intent(out) :: H(UNCERT_RES)
+	
+	integer, allocatable :: Ai(:)
+	
+	real(c_double) :: Amin, Amax
+	integer :: i
+	
+	allocate(Ai(SAMPLE_NO))
+	
+	Amin = minval(A)
+	Amax = maxval(A)
+	
+	H=0
+	Ai = ceiling((A - Amin) / (Amax - Amin) * (UNCERT_RES - 2)) + 1
+	
+	do concurrent (i=1:SAMPLE_NO)
+		H( Ai(i) ) = H( Ai(i) ) + 1 
+	end do 
+
+	B = linspace(Amin, Amax, UNCERT_RES)
+	
+	H = H / real(SAMPLE_NO, kind=c_double)
+	
+end subroutine
+\end{code}
+\end{codeblock}
+
+\subsection{Convenience Functions To Avoid The GIL}
+
+
+One of the big annoyances with python for me that that even if you have a fast function in an external library, the process of calling that function is actually really slow. 
+In addition, because for some reason python people think it is ok to still be single threaded, you cannot parallelise things (easily) from the python side.
+
+As such these next two subroutines are a bit more tailored to this specific application, as having these outside of python allows easy parallelisation using OpenMP, as well as avoiding the overhead of calling a function from within a loop. 
+
+
+\begin{codeblock}{prop_pdf_all}
+\subsubsection{prop\_pdf\_all}
+
+
+One of the types of array we have later on in the Python sections is a \nd{3} array where the fast axis is a distribution. Specifically it is $\eta \times \beta \times \text{dist}$ array. 
+
+If we want to multiply two of these objects, such as when we are calculating efficiency
+\begin{equation}
+\varepsilon = \varepsilon_\text{algo} \cdot \varepsilon_{\eta \beta} \cdot \varepsilon_\text{trigger}
+\end{equation}
+Then it makes sense that we should have a function to multiply each distribution in the array. 
+
+Note that we cannot use the Fortran "do concurrent" here as "prop_pdf" is not a pure function. Even though it should be fine, the compiler limits us. As such we are using OpenMP to parallelise this do loop. 
+
+\begin{code}
+subroutine prop_pdf_all(op, p1, p2, x1, x2, h, xo) bind(c)
+	character(len=1, kind=c_char), intent(in) :: op 
+	real(c_double), dimension(UNCERT_RES, BINS, BINS), intent(in) :: p1, p2, x1, x2
+	real(c_double), dimension(UNCERT_RES, BINS, BINS), intent(out) :: h, xo
+	
+	integer :: i, j
+	
+	!$OMP PARALLEL DO
+	do j = 1, BINS
+		print *, j, OMP_GET_THREAD_NUM()
+		do i = 1, BINS
+			call prop_pdf(op, p1(:, i, j), p2(:, i, j), &
+			                  x1(:, i, j), x2(:, i, j), &
+			                   h(:, i, j), xo(:, i, j))
+		end do
+	end do 
+	!$OMP END PARALLEL DO
+	
+end subroutine
+\end{code}
+\end{codeblock}
+
+\subsubsection{prop\_pdf\_sum2d}
+\begin{codeblock}{prop_pdf_sum2d}
+
+The second subroutine to bypass the GIL is somewhat related to the first. 
+At some point we want to sum over the $\eta\times\beta$ array to get a single number for the efficiency that the LHCb can see. 
+
+This running summation is a little bit harder to parallelise as each thread needs to have its own partial summation, before they are combined back together at the end. However OpenMP still makes this fairly straight forward. 
+
+Note that we need to first put some numbers into "run_sum" so that we can later add it up in a loop.
+Also note that just filling "run_sum" with zeros will not word due to it not being regular addition, but the sampled addition. 
+
+As such we first initialise "run_sum" using the first two distributions from $p$. We also initialise "part_sum" using the first two distributions that each \emph{individual} thread sees. 
+
+Finally one hurdle is that we need to use allocatable arrays as opposed to saving the array to the heap. This is because OpenMP sees variables marked with "save" as global between threads, and allocated ones as local to the thread. This lead to some very not-fun bugs.
+
+\begin{code}
+subroutine prop_pdf_sum2d(p, x, run_sum, run_sum_x) bind(c)
+	real(c_double), dimension(UNCERT_RES, BINS, BINS), intent(in)  :: p, x
+	real(c_double), dimension(UNCERT_RES), intent(out) :: run_sum, run_sum_x 
+	
+	real(c_double), allocatable :: part_sum(:), part_sum_x(:)
+	real(c_double), allocatable :: tmp_out(:), tmp_out_x(:)
+	integer :: si, sj
+	logical :: s
+	
+	integer :: i, j
+\end{code}
+
+call it once just to make sure there is something sensible in \verb|run_sum| when we start adding stuff to it repeatedly 
+
+\begin{code}
+	call prop_pdf('+', p(:, 1, 1), p(:, 1, 2), &
+	                   x(:, 1, 1), x(:, 1, 2), &
+	                   run_sum, run_sum_x)
+	
+	!$OMP PARALLEL &
+	!$OMP PRIVATE(part_sum, part_sum_x, tmp_out, tmp_out_x, s, si, sj) &
+	!$OMP SHARED(run_sum, run_sum_x)
+	si = 0
+	sj = 0
+	s = .True.
+	
+	allocate(part_sum(UNCERT_RES), part_sum_x(UNCERT_RES), &
+	          tmp_out(UNCERT_RES),  tmp_out_x(UNCERT_RES))
+	
+	!$OMP DO
+	do j = 1, BINS
+		do i = 1, BINS
+\end{code}
+
+We don't want to double count the ones we just added so lets just skip over the $(1,1)$ and $(1,2)$ cases.
+
+\begin{code}
+			if ( .not. (( i == 1 ) .and. (( j == 1) .or. ( j == 2 ))) ) then 
+				if ( s ) then
+					if ( si == 0 ) then 
+						si = i; sj = j
+					else
+						call prop_pdf('+', p(:, si, sj), p(:, i, j), &
+						                   x(:, si, sj), x(:, i, j), &
+						                   part_sum, part_sum_x)	
+						s = .False.
+					end if 
+					
+				else 
+					call prop_pdf('+', p(:, i, j), part_sum,   &
+					                   x(:, i, j), part_sum_x, &
+					                   tmp_out, tmp_out_x)
+					part_sum   = tmp_out
+					part_sum_x = tmp_out_x
+				end if 
+			end if
+		end do
+	end do 
+	!$OMP END DO
+\end{code}
+
+Finally we add up each partial sum that each thread has. Note that we need to do this in a critical single threaded section to avoid mixing the arrays as they get written. 
+\begin{code}
+	!$OMP CRITICAL 
+	call prop_pdf('+', run_sum,   part_sum,   &
+	                   run_sum_x, part_sum_x, &
+	                   tmp_out,   tmp_out_x)
+	run_sum   = tmp_out
+	run_sum_x = tmp_out_x
+	!$OMP END CRITICAL 
+	!$OMP END PARALLEL
+	
+end subroutine
+end module
+\end{code}
+\end{codeblock}
+\end{codeblock}
+\end{subfile}
+
+\section{\texttt{ie.py}}
+
+Now we go back to Python-land and all its weirdness. The python here is more about analysing the number of magnetic monopoles that we should expect from the LHCb run 1 data. (Assuming the monopoles have the cross sections, $\eta$ and $\beta$ that madgraph predicts).
+
+
+\begin{code}
+import numpy as np
+import matplotlib.pyplot as plt
+import glob
+import scipy.stats as sps
+import scipy.special as spsl
+import os 
+from ctypes import *
+\end{code}
+
+\begin{codevar}{L, BINS, UNCERT_RES, SAMPLE_NO}
+
+here $L$ is the luminosity of the LHC run 1, $3000$ \si{\per\pico\barn}
+
+\begin{code}
+L = 3E3
+BINS = 50
+UNCERT_RES = 1000
+SAMPLE_NO = 100000
+\end{code}
+\end{codevar}
+
+\begin{code}
+so = CDLL("./fastlib.so")
+so.prop_pdf.argtypes       =   [np.ctypeslib.ndpointer(dtype=c_char,   ndim=1, flags="C"), 
+                              *[np.ctypeslib.ndpointer(dtype=c_double, ndim=1, flags="C")]*6]
+so.prop_pdf_sum2d.argtypes = [*[np.ctypeslib.ndpointer(dtype=c_double, ndim=3, flags="C")]*2, 
+                              *[np.ctypeslib.ndpointer(dtype=c_double, ndim=1, flags="C")]*2]
+so.prop_pdf_all.argtypes   =   [np.ctypeslib.ndpointer(dtype=c_char,   ndim=1, flags="C"), 
+                              *[np.ctypeslib.ndpointer(dtype=c_double, ndim=3, flags="C")]*6]
+so.choice.argtypes         = [*[np.ctypeslib.ndpointer(dtype=c_double, ndim=1, flags="C")]*3]
+\end{code}
+
+\section{Probability Distribution Functions}
+
+Two of the measurements used in this code are sampled from a binomial distribution. This raises the question what is the uncertainty on the parameter $p$?
+
+I initially wanted to use the standard deviation of a binomial distribution:
+
+\begin{equation}
+ \sigma = \sqrt{\frac{p(1-p)}{n}}
+\end{equation}
+
+However this is very problematic when $p=0$ or $p=1$ as the error would then go to zero, even if there are samples there. As The hough transform is very accurate in the vast majority of cases, it makes sense that there are \emph{always} going to be bins where $p=1$. 
+
+The reason that this problematic behaviour emerges is that the standard deviation is fundamentally a parameter from a normal distribution, \emph{not} a binomial. whilst the binomial distribution may approximate a normal distribution, it is a \emph{very} bad approximation when $p=1$ or $p=0$.
+
+We can get a much better estimate for the uncertainty if we consider a Bayesian approach for the prior probability distribution of $p$. Once we have this distribution, we can use the above sampling methods from Section \ref{sec:fastlib} to propagate this distribution. And with any luck we should have something resembling a normal distribution out the other side thanks to the Central Limit Theorem.
+
+To calculate the prior probability distribution $P(p\,|\,k,N)$, we start by considering Bayes' theorem:
+
+\begin{equation}
+ P(p\,|\,k,N) = \frac{ P(k \,|\,p,N)  P(p\,|\,N) }{\mathcal{Z}}
+ \label{eqn:binom1}
+\end{equation}
+
+The likelihood of seeing $k$ successes, for a given $p$ over $N$ trials, is just the regular old binomial distribution.
+
+\begin{equation}
+ P(k \,|\,p,N) = \frac{N!}{k!(N-k)!}p^k(1-p)^{N-k}
+\end{equation}
+
+Similarly one should not expect a different value of $p$ only considering the number of trials. 
+
+\begin{equation}
+ P(p \,|\,N) = \begin{cases}1 ,& 0 \leq p \leq 1 \\ 0 ,& \text{otherwise} \end{cases}
+\end{equation}
+
+All that is left now is to determine $\mathcal{Z}$. This can be thought of a a normalisation constant ensuring that the total probability integrates to $1$
+
+\begin{equation}
+ \int_{-\infty}^\infty P(p\,|\,k,N) \,\dd p = 1
+\end{equation}
+
+If we substitute in for $P(k \,|\,p,N)$.
+
+\begin{align}
+ 1 =& \int_{-\infty}^\infty  \frac{ P(k \,|\,p,N)  P(p\,|\,N) }{\mathcal{Z}} \,\dd p\\
+ 1 =& \frac{1}{\mathcal{Z}}\int_{0}^1 \frac{N!}{k!(N-k)!}p^k(1-p)^{N-k} \,\dd p
+\end{align}
+
+Pulling $\mathcal{Z}$ over to the other side, and placing some suggestive brackets in the exponents of $p$ we get:
+
+\begin{equation}
+ \mathcal{Z} =  \frac{N!}{k!(N-k)!} \int_0^1 p^{(k+1)-1}(1-p)^{(N-k+1)-1} \,\dd p
+\end{equation}
+
+From this we recognise that the integral is just the beta function $\mathrm B(z_1, z_2)$ defined by:
+
+\begin{equation}
+ \mathrm B(z_1, z_2) = \int_0^1 t^{z_1-1}(1-t)^{z_1-1}\,\dd t, \qquad \real \mathrm e(z_1), \real \mathrm e  (z_2) > 0
+\end{equation}
+
+Whilst it is possible to simplify the beta function into a representation by the gamma function, I am leaving it as the beta distribution due to "scipy.specials" having it already in the library. Moreover by using the library function we avoid the risk of overflows for large $N$ as the gamma function is \emph{very} quick growing.
+
+Putting this all together we arrive at the prior probability distribution for $p$:
+
+\begin{equation}
+P(p \,|\, k, N ) = \frac{1}{\mathrm B(k+1, N-k+1)} p^k (1-p)^{N-k}
+ \label{eqn:binom2}
+\end{equation}
+
+Finally something to note about the domain that we are sampling on: It is very easy for the "binom_ucert" function to be very spiky when $N$ is large and $p=1$ or $0$. As such if we set our sample range to be $p\in[0,1]$ we will only have a few samples that have $P(p \,|\, k, N )$ above zero. As such we first do a `dummy sample' over the entire $p\in[0,1]$ range, then use this as a basis to zoom in on the area where $P > 10^{-5}$.  
+
+Finally in the below function I have renamed $p \to x$, and $P(p \,|\, k, N ) \to p$, just to avoid confusion with two different $p$'s
+
+\begin{codeblock}{binom_ucert}
+\begin{code}
+def binom_ucert(N, k):
+	print(np.shape(N), np.shape(k))
+	p = np.empty((*np.shape(k), UNCERT_RES))
+	x = np.empty((*np.shape(k), UNCERT_RES))
+	k = k*N
+\end{code}
+
+One of the problems I encountered is that $k$ is a \nd2 array, but $x$ and $p$ are \nd3 arrays, where the extra dimensions carries the distribution.
+
+This leads to some indexing issues with numpy that are somewhat annoying to resolve. If we want to slice $p$ so that a distribution for a single $\eta$, $\beta$, then we first use "np.ndenumerate(k)". This returns the value of $k$ at a point (in $c$), and a tuple for the indices. 
+
+This all seems simple enough, but the naïve method of taking the slice as $p[i, :]$ does not work. This is because we are using the wrong tuple ordering in the index $((i_1, i_2), :)$, instead of $(i_1, i_2, :)$. This leads to us creating a $2\times\text{\texttt{BINS}}\times\text{\texttt{UNCERT\_RES}}$ object instead. 
+
+Ok, you might say, let us unpack $i$ using the $\ast$ operator as $p[\ast i, :]$, however this is a syntax error. The way you actually do it is to manually construct the new tuple as $(\ast i, \mathrm{Slice}(\ast[\mathrm{None}] \times 3))$. Where the \oldstylenums3 arguments of Slice are the start, stop and stride (With None being default).
+
+{\tiny And they say python is pseudocode, lies, \emph{lies} I tell you. }
+
+\begin{code}
+	for i, c in np.ndenumerate(k):
+		j = (*i, slice(*[None]*3))
+		x_tmp = np.linspace(0+np.finfo(np.float64).eps,
+		                    1-np.finfo(np.float64).eps,
+		                    1_000_00)
+		p_tmp = sps.beta.pdf(x_tmp, c+1, N[i]-c+1)
+		p_tmp = p_tmp/N[i]
+\end{code}
+
+As previously mentioned having the default range be $x \in [0,1]$ leads to some weird behavior due to only a few samples being greater than zero. As such we use that first measurement to create a new one zoomed in on the area we are interested in
+
+\begin{code}
+		m = ( p_tmp > 1E-5 )
+		
+		x[j] = np.linspace(x_tmp[m][0], x_tmp[m][-1], UNCERT_RES)
+		p[j] = sps.beta.pdf(x[j], c+1, N[i]-c+1)
+		p[j] = p[j]/np.sum(p[j])
+	
+	return p, x
+\end{code}
+\end{codeblock}
+
+We can do the exact same procedure for the cross section as was done for the binomial in Equations (\ref{eqn:binom1}-\ref{eqn:binom2}), however I will not repeat it here. 
+
+The result however is that the prior probability distribution is exactly the same as the normal distribution we started with:
+
+\begin{equation}
+ P(x \,|\, \mu, \sigma) = P(\mu \,|\, x, \sigma) = \frac{1}{\sigma \sqrt{2\pi}} e^{-\frac{1}{2}\left( \frac{x-\mu}{\sigma} \right)^2}
+\end{equation}
+
+This makes it really easy to to generate the prior probability distribution as scipy has normal functions built in, and moreover we can use the standard deviation to easily focus in on the region that we are interested in $x\in [\mu-5\sigma, \mu+5\sigma]$.
+
+
+\begin{codeblock}{norm_ucert}
+\begin{code}
+def norm_ucert(μ, σ):
+	x = np.linspace(μ-5*σ, μ+5*σ, UNCERT_RES)
+	p = sps.norm.pdf(x, μ, σ)
+	return p, x
+\end{code}
+\end{codeblock}
+
+\subsection{Running on the Data}
+
+The first thing we do is load the data generated from \textsc{madgraph} and the hough transform. We want to load the psudorapidity $\eta$, the velocity $\beta$. the mass $m$ and the cross section $\sigma$.
+
+Note that in the loaded data "_h" means it came from the hough transform and "_m" means the values came from \textsc{madgraph}. 
+At the moment the hough transform is using data from my faux generator and not the data from bender and loki (mostly because there is not enough of it to get good coverage of the full $\eta$, $\beta$ space)
+
+\begin{codeblock}{main}
+\begin{code}
+def main(fn):
+	fd = np.load(fn)
+	m_m = fd["m"]
+	β_m = fd["beta"]
+	η_m = fd["eta"]
+	σ_m = fd["sigma"]
+	MAX_P = fd["MAX_P"]
+	del(fd)
+	
+	fd = np.load("hough.npz")
+	β_h  = fd["beta"]
+	η_h  = fd["eta"]
+	l_h  = fd["l"]
+	ll_h = fd["ll"]
+	del(fd)
+	
+	N = np.zeros(len(m_m))
+	N_e = np.zeros(len(m_m))
+\end{code}
+
+The first thing we are going to do is find the efficiency of the hough transform algo. This can be easily supplemented with the NN algo.
+
+The way we calculate this is by taking: 
+
+\begin{equation}
+\varepsilon_\text{algo} = \frac{N_\text{\checkmark}(\eta, \beta)}{N(\eta, \beta)}
+\end{equation}
+
+The fraction of correct guesses for a given $\eta$, $\beta$. To do this we use a \oldstylenums2\textsc{d} histogram for the distributions of both $N_\text{\checkmark}$ (called "hh_g") and $N$ (called "hh_a").
+
+One important thing that we are doing here is setting the range to be $2 < \eta < 5$ and $\frac{1}{n_\text{a}} < \beta < 1$, as this is the only range that the LHCb can see. 
+
+Finally as the faux data contains samples, with and without monopoles, we use the bool $\ell$, to create a mask for only the values that contain monopoles. 
+
+\begin{code}
+	hh_a = plt.hist2d(η_h[l_h],
+	                  β_h[l_h],
+	                  bins=BINS,
+	                  range=[[2, 5],[1/1.03, 1]])[0]
+	
+	hh_g = plt.hist2d(η_h[np.logical_and(l_h, ll_h)],
+	                  β_h[np.logical_and(l_h, ll_h)],
+	                  bins=BINS,
+	                  range=[[2, 5], [1/1.03, 1]])[0]
+\end{code}
+
+One important thing to note is that If there are no samples in a particular $\eta$, $\beta$ bin, then there are no samples for the algo to get correct. 
+This might sound simple enough, but it allows us to 1. avoid divide by zero, 2. Set what value is used for the no-data case. 
+
+We do this by using a machine epsilon $\epsilon$. Here we have chosen the no-data case to be $0$ as:
+
+\begin{equation}
+ \frac{N_\text{\checkmark}}{N + \epsilon} = \frac{0}{\epsilon} = 0 
+\end{equation}
+
+However other values can be chosen by putting $\epsilon$ in the numerator.
+
+\begin{code}
+	n = hh_a + np.finfo(np.float64).eps
+	p = hh_g / n 
+\end{code}
+
+To get a value for $\varepsilon_\text{algo}$, we assume that it is a binomial distribution of data, However as the fraction of success is very large for sufficiently nice $\eta$, $\beta$, this results in $p=1$ and so we need to propagate the uncertainly the hard way.
+
+\begin{code}
+	ε_algo, ε_algo_x = binom_ucert(n, p)
+\end{code}
+
+One of the big differences between the data generated by \textsc{madgraph} and the data used elsewhere is that the \textsc{madgraph} data is a function of monopole mass. 
+
+As such we go though each simulation of the monopole at a different mass and produce a histogram of $\eta$, $\beta$ at that mass. 
+Note that unlike the faux data this histogram's range will sometimes exclude up to $90\%$ of the simulated events. This is by design as we are interested in the efficiency of both $\eta$ and $\beta$. Moreover we can get both at the same time by creating a histogram of the simulated $\eta$ and $\beta$, and then only looking at the fraction inside the range the LHCb can detect. 
+
+Note that unlike the above distribution where we are comparing the fraction of correct guesses for a given $\eta$, $\beta$, In this case we are comparing the fraction of \emph{total} particles that sit in a bin.
+
+Note that we are using $\text{\texttt{MAX\_P}}=10000$ as the number of particles, however for each "MAX_P" event there are two particles: $m^+$, $m^-$. I did ask McCann about this, and he said just to use "MAX_P" as the number of particles so that's what I did.
+
+\begin{code}
+	for i, m in enumerate(m_m):
+		p = plt.hist2d(η_m[i, :],
+		               β_m[i, :],
+		               bins=BINS,
+		               range=[[2, 5], [1/1.003, 1]])[0]/MAX_P[i]
+		plt.imsave("a.png", p)
+		ε_ηβ, ε_ηβ_x = binom_ucert(np.ones(np.shape(p))*MAX_P[i], p)
+\end{code}
+
+Finally we multiply these all together to get the total efficiency:
+
+\begin{equation}
+ \varepsilon = \varepsilon_\text{algo} \cdot \varepsilon_{\eta\beta} \cdot \varepsilon_\text{trigger}
+\end{equation}
+
+Note that at the moment we have no estimate on the efficiency of the triggering system and so I have just taken as the constant $\varepsilon_\text{trigger} = 10^{-3}$
+
+\begin{code}
+		ε_trig = 0.03 * 1/100 * 1/36 * 1/30000
+		
+		ε   = np.empty((BINS, BINS, UNCERT_RES))
+		ε_x = np.empty((BINS, BINS, UNCERT_RES))
+		
+		so.prop_pdf_all(np.array(['*'], dtype=c_char), 
+		                ε_algo, ε_ηβ,
+		                ε_algo_x, ε_ηβ_x,
+		                ε, ε_x)
+		ε_x = ε_x * ε_trig
+\end{code}
+
+Finally we calculate the Expected number of monopoles that we should see. This is done using the formula:
+
+\begin{equation}
+ N = \sigma \mathcal{L} \varepsilon
+\end{equation}
+
+where $\sigma$ this time is the cross section, and $\mathcal{L}$ is the luminosity of the LHCb run 1 ($3$ \si{\per\femto\barn}). 
+
+Again we are using the above Equation \eqref{eqn:un} to calculate the uncertainties (separately for the lower and upper this time due to broadcasting issues). Again like last time this is problematic and is not real statistics. 
+
+Note that at the present time I do not have a measure on the uncertainties for the luminosity. 
+
+\begin{code}
+		ε_sum = np.zeros(UNCERT_RES)
+		ε_sum_x = np.zeros(UNCERT_RES)
+		
+		so.prop_pdf_sum2d(ε, ε_x, ε_sum, ε_sum_x)
+		
+		σ_sample = np.empty(SAMPLE_NO)
+		ε_sum_sample = np.empty(SAMPLE_NO)
+		
+		so.choice( *norm_ucert( *σ_m[i, :] ), σ_sample)
+		so.choice(ε_sum, ε_sum_x, ε_sum_sample)
+		
+		N_sample = σ_sample * ε_sum_sample * L
+		del(σ_sample, ε_sum_sample)
+		
+		N[i] = np.mean(N_sample)
+		N_e[i] = np.std(N_sample)
+\end{code}
+
+Finally some simple familiar saving the data and plotting the result
+
+\begin{code}
+		print( "%s, %d, %E, %E" % (fn, m, N[i], N_e[i]) )
+	print("Saving for: ", fn )
+	np.savetxt(fn.split(".npz")[0]+"Nsd.tsv", np.array([m_m, N, N_e, N_e]).T)	
+	return 
+\end{code}
+\end{codeblock}
+
+Due to the way that the data is stored in folders and then separately in "npz" files, one for each type of monopole (different spins, etc), we need to use glob to go though them all. 
+
+The final plotting is done by pgfplots, and so we invoke a \LaTeX{} call over all of the folders. Note that called to "cd" in "os.system" return back to the original directory after exit.
+
+\begin{code}
+if __name__ == "__main__":
+	#for fn in [*glob.glob("gg*/*.npz"), *glob.glob("aa*/*.npz")]:
+	for fn in [*glob.glob("aa-m3*/*.npz")]:
+		print(fn)
+		main(fn)
+
+	if True:
+		for tn in [*glob.glob("gg*"), *glob.glob("aa*")]:
+			os.system("cd "+tn+"; latexmk -pdf ")
+\end{code}
+\begin{minipage}{\textwidth}
+\printindex
+\end{minipage}
+\end{document}

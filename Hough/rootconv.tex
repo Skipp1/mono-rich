@@ -1,0 +1,135 @@
+\documentclass[10pt, a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{makeidx}
+\usepackage[scale=0.85]{sourcecodepro}
+\usepackage{amsmath, amssymb, amsfonts}
+\usepackage{microtype}
+\usepackage{bookmark}
+\usepackage{geometry}
+\usepackage[print=m, lang=cpp]{fortex}
+
+\makeindex
+
+\usemintedstyle{ayu}
+\setfortex{tabsize=2, breaksymbol=\scriptsize{$\hookrightarrow$}, fontsize=\small}
+\DefineShortVerb{\"}
+
+\begin{document}
+
+This file is just a controller for the Fortran that I wrote earlier. 
+
+I initially tried doing this in "C++", but I was unable to extract the "TTree" from the "TFile". 
+There is obviously a way to do it, the the ROOT docs are kinda horrific. 
+
+At some point I do want to translate this to regular "C++" but idk when that will be. 
+\index{C++}
+\begin{code}
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <TFile.h>
+#include <TTreeReader.h>
+#include <TTreeReaderArray.h>
+#include <TCanvas.h>
+#include <TGraph.h>
+#include "conv.h"
+\end{code}
+
+We need to declare a header file for "find_circ". 
+This is not actually in a header file but that should be find because I am only going to "#include" it here anyway.
+
+We also need to use \verb|extern "C"| to avoid the "C++" name mangling.
+
+This should probs belong in a header file, but for the moment because fortex is not smart enough to have subfiles yet, ill just put it here manually. 
+
+\begin{code}
+int main(void) {
+	init_conv();
+	TFile file("../ns~real.root");
+// 	TTree *tree = (TTree *) file.Get("tuple/tuple");
+	TTree *tree = (TTree *) file.Get("RICH/OfflineMonopoleFinderR1Gas/OfflineMonopoleFinderR1Gas");
+	tree->SetBranchStatus("*", 0);
+	tree->SetBranchStatus("nHits", 1);
+// 	tree->SetBranchStatus("HitRICH", 1);
+	tree->SetBranchStatus("HitPosX", 1);
+	tree->SetBranchStatus("HitPosY", 1);
+	tree->SetBranchStatus("HitPosZ", 1);
+// 	tree->SetBranchStatus("Generated_PE", 1);
+// 	tree->SetBranchStatus("Generated_PX", 1);
+// 	tree->SetBranchStatus("Generated_PY", 1);
+// 	tree->SetBranchStatus("Generated_PZ", 1);
+\end{code}
+we need to allocate the arrays we are going to read the leaf elements into. 
+However, the size of those arrays is contained as a leaf element ($N_\text{hit}$). 
+
+This is obviously problematic, as $N_\text{hit}$ is not a constant for each element. 
+
+Obviously this is not idea, but for the moment it is both fast to code and execute than it is to do "realloc" on every element. 
+Besides as we are passing the length of the array as an explicit element to the Fortran side of the code it is a non-issue, as we just read that. 
+
+\begin{code}
+	int N_max = tree->GetLeaf("nHits")->GetMaximum();
+\end{code}
+
+Using this information we can then allocate the rest of the arrays. 
+
+\begin{code}
+	int N;
+// 	float sensor[N_max];
+	float x[N_max];
+	float y[N_max];
+	float z[N_max];
+	
+// 	double pe;
+// 	double px;
+// 	double py;
+// 	double pz;
+	
+	float retval[4];
+\end{code}
+
+We then use pointers to $x$, $y$ and $N$ that get loaded every time "tree->GetEntry(i)" is called. 
+This looks more parallisable than the "TTreeReader" implementation, but it still relys on these global and that makes it annoying. 
+
+\begin{code}
+	tree->SetBranchAddress("nHits", &N);
+// 	tree->SetBranchAddress("HitRICH", &sensor);
+	tree->SetBranchAddress("HitPosX", &x);
+	tree->SetBranchAddress("HitPosY", &y);
+	tree->SetBranchAddress("HitPosZ", &z);
+// 	tree->SetBranchAddress("Generated_PE", &pe);
+// 	tree->SetBranchAddress("Generated_PX", &px);
+// 	tree->SetBranchAddress("Generated_PY", &py);
+// 	tree->SetBranchAddress("Generated_PZ", &pz);
+\end{code}
+
+Here we are going to be calling a loop to compute our FFTs. 
+We do this in Fortran because it is a lot easier to work with arrays in Fortran than it is a C based language.
+
+Ideally I want to parallelise this look, but for the moment single threaded code seems to be good enough.
+
+\begin{code}
+	int n_entry = tree->GetEntries();
+	printf("Number of events: %d\n\n", n_entry);
+
+	for (int i=0; i<n_entry; i++) {
+		tree->GetEntry(i);
+
+		if (N == 0) {
+			continue;
+		}
+		
+		find_circ_centre(&N, x, y, z, retval);
+		printf("x: %g, y: %g, r: %g, mag: %g\n", retval[0], retval[1], retval[2], retval[3]/(128 * 128 * 16 * 1000));
+\end{code}
+
+\begin{code}
+	}
+	delete_conv();
+	return 0;
+}
+\end{code}
+
+
+\printindex
+\end{document}
